@@ -6,6 +6,7 @@ Prompt Compressor Interactive Demo
 
 import gradio as gr
 import plotly.graph_objects as go
+import os
 from typing import List, Tuple
 
 from compressor import MockCompressor, CompressionResult
@@ -464,9 +465,13 @@ with gr.Blocks(title="Prompt Compressor Demo") as demo:
 
 
 if __name__ == "__main__":
+    # 默认绑定 localhost，避免直接访问 0.0.0.0 导致浏览器报错。
+    server_name = os.getenv("GRADIO_SERVER_NAME", "127.0.0.1")
+    server_port = int(os.getenv("GRADIO_SERVER_PORT", "7860"))
+
     demo.launch(
-        server_name="0.0.0.0",
-        server_port=7860,
+        server_name=server_name,
+        server_port=server_port,
         share=False,
         theme=gr.themes.Soft(),
     )
