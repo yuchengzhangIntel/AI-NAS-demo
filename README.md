@@ -37,9 +37,9 @@ python prompt_compressor_demo.py
 
 当前版本压缩逻辑由 `compressor/mock.py` 承担。如果需要接入真实的“词法压缩服务（LLMLingua2等）”和“Ollama 本地 LLM 生成”，需要实现并替换这部分 mock，主要涉及下述接口对齐。
 
-### 1. 压缩服务 (Compression Service)
+### 1. 压缩服务（TTC）
 
-已有函数签名参考如下，你需要将其封装为一个异步 HTTP/RPC 请求链路：
+已有函数签名参考如下，你需要将其封装为一个 HTTP 请求链路：
 ```python
 def compress_prompt_llmlingua2(
     self,
@@ -64,7 +64,7 @@ def compress_prompt_llmlingua2(
 ```
 
 **待确认细节：**
-- **地址与协议：** 压缩微服务部署在网络什么位置？是 REST HTTP（发送 JSON）还是 gRPC？
+- **地址与协议：** 压缩服务（TTC）部署在网络什么位置？是怎样的 HTTP 接口（URL、请求体JSON和返回JSON样例）？
 - **Query 传参规则：** 当用户在页面取消勾选 `Query-Aware 模式` 并且留空 Query 时，请求这个服务到底传什么？（传空字符串还是忽略该字段？）
 - **返回体解析：** 目前 `parse_labeled_original` 假设压缩服务返回的标注文本是由 `\t\t|\t\t` 与 ` ` 分割的字符串（用 1 表示保留，0 表示废弃）。真实联调时如果返回词和标签分离的 JSON 数组，解析函数需要一并修改。
 
@@ -76,4 +76,10 @@ def compress_prompt_llmlingua2(
 
 **待确认细节：**
 - **Ollama 地址与模型：** 配置如 `http://localhost:11434/api/generate` 及你使用的轻量语言模型名（如 `llama3`, `qwen2` 等）。
-- **指标统计：** UI 底部有 TTFT 和 KV Cache 的雷达对比视图。这要求无论是走 Ollama 还是压缩微服务，返回的 HTTP Header 或 Body 中得有这部分统计数据（如 `eval_count`, `prompt_eval_duration`），或者需要自己在 Python 发请求前后分别埋点打时间戳计时计算。如果没有对应指标且不自己埋点，只能在界面上隐藏这一面板。
+- **指标统计：** UI 底部有 TTFT 和 KV Cache 的雷达对比视图。这要求无论是走 Ollama 还是压缩服务（TTC），返回的 HTTP Header 或 Body 中得有这部分统计数据（如 `eval_count`, `prompt_eval_duration`），或者需要自己在 Python 发请求前后分别埋点打时间戳计时计算。如果没有对应指标且不自己埋点，只能在界面上隐藏这一面板。
+
+---
+
+## 开发参考
+
+后续编写或扩展 Gradio 前端代码时，推荐先阅读代码库自带的开发指南：[`.agents/skills/gradio/SKILL.md`](.agents/skills/gradio/SKILL.md)。该文档涵盖了 Gradio 的核心组件用法、自定义 HTML/CSS 嵌入技巧以及事件监听等高级用法。
