@@ -3,57 +3,175 @@ Prompt Compressor Interactive Demo
 
 使用Gradio构建的交互式Demo，展示Prompt压缩算法的效果。
 """
+import os
+os.environ["NO_PROXY"] = "localhost,127.0.0.1,::1"
+
 
 import gradio as gr
+import html
 import plotly.graph_objects as go
-import os
+import re
+from functools import lru_cache
 from typing import List, Tuple
+
+import spacy
 
 from compressor import MockCompressor, CompressionResult
 from data.examples import EXAMPLE_CHOICES, get_example
 
 
-def parse_labeled_original_to_highlighted(labeled_original: str) -> List[Tuple[str, str]]:
+CUSTOM_CSS = """
+#token-heatmap-html {
+    border: 1px solid #e5e7eb;
+    border-radius: 12px;
+    padding: 16px;
+    background: #ffffff;
+}
+
+#token-heatmap-html .token-visualization {
+    white-space: pre-wrap;
+    line-height: 1.9;
+    font-size: 0.95rem;
+    font-family: "Times New Roman", Times, serif;
+}
+
+#token-heatmap-html .token-span {
+    border-radius: 0.3rem;
+    padding: 0.03rem 0.08rem;
+    box-decoration-break: clone;
+    -webkit-box-decoration-break: clone;
+}
+
+#token-heatmap-html .token-keep {
+    background: rgba(76, 175, 80, 0.18);
+}
+
+#token-heatmap-html .token-drop {
+    background: rgba(148, 163, 184, 0.18);
+    color: #475569;
+}
+
+#token-heatmap-html .token-entity {
+    display: inline-block;
+    line-height: 1;
+    padding-bottom: 0.08em;
+    border-bottom: 2px solid #c2410c;
+}
+
+.times-display textarea,
+.times-display input {
+    font-family: "Times New Roman", Times, serif;
+}
+"""
+
+WORD_SEPARATOR = "\t\t|\t\t"
+TOKEN_PATTERN = re.compile(r"\S+|\s+")
+CHINESE_CHAR_PATTERN = re.compile(r"[\u4e00-\u9fff]")
+
+
+def parse_labeled_original(labeled_original: str) -> List[Tuple[str, str]]:
     """
-    解析真实接口返回的 fn_labeled_original_prompt
+    解析真实接口返回的 fn_labeled_original_prompt。
 
     格式: "word1 1\t\t|\t\tword2 0\t\t|\t\tword3 1..."
     返回: [("word1", "keep"), ("word2", "drop"), ("word3", "keep")]
-
-    Label映射:
-    - "entity": 黄色 - 命名实体（大写且非句首）
-    - "keep": 绿色 - 关键保留 (label="1")
-    - "drop": 浅灰 - 冗余删除 (label="0")
     """
     if not labeled_original:
         return []
 
-    word_sep = "\t\t|\t\t"
-    segments = labeled_original.split(word_sep)
+    segments = labeled_original.split(WORD_SEPARATOR)
 
     result = []
     for segment in segments:
         if not segment.strip():
             continue
-        # 格式: "word label"
+
         parts = segment.rsplit(" ", 1)
         if len(parts) == 2:
             word, label = parts
-
-            # label="1" -> keep, label="0" -> drop
-            if label.strip() == "1":
-                label_name = "keep"
-            else:
-                label_name = "drop"
-
-            # 简单NER规则: 大写且非句首 -> entity
-            # 排除常见的句首大写词和标点
-            if word and word[0].isupper() and len(word) > 2 and word not in ["The", "A", "An", "It", "This", "That"]:
-                label_name = "entity"
-
+            label_name = "keep" if label.strip() == "1" else "drop"
             result.append((word, label_name))
 
     return result
+
+
+@lru_cache(maxsize=2)
+def get_spacy_model(language: str):
+    """按语言懒加载 spaCy 模型，未安装模型时退化为空模型。"""
+    model_name = "zh_core_web_sm" if language == "zh" else "en_core_web_sm"
+    blank_language = "zh" if language == "zh" else "en"
+
+    try:
+        return spacy.load(model_name, disable=["tagger", "parser", "lemmatizer", "textcat"])
+    except OSError:
+        return spacy.blank(blank_language)
+
+
+def detect_spacy_language(text: str) -> str:
+    """含中文字符时优先使用中文模型，否则使用英文模型。"""
+    return "zh" if CHINESE_CHAR_PATTERN.search(text) else "en"
+
+
+def get_entity_spans(text: str) -> List[Tuple[int, int]]:
+    """返回实体的字符级区间。"""
+    if not text:
+        return []
+
+    nlp = get_spacy_model(detect_spacy_language(text))
+    doc = nlp(text)
+    return [(ent.start_char, ent.end_char) for ent in doc.ents]
+
+
+def align_labels_to_text(text: str, labeled_original: str) -> List[Tuple[str, str | None, int, int]]:
+    """把 split() 产生的词标签重新对齐回原始文本，保留空格和换行。"""
+    parsed_labels = parse_labeled_original(labeled_original)
+    segments: List[Tuple[str, str | None, int, int]] = []
+    label_index = 0
+
+    for match in TOKEN_PATTERN.finditer(text):
+        segment_text = match.group(0)
+        label_name = None
+        if not segment_text.isspace() and label_index < len(parsed_labels):
+            _, label_name = parsed_labels[label_index]
+            label_index += 1
+
+        segments.append((segment_text, label_name, match.start(), match.end()))
+
+    return segments
+
+
+def is_entity_segment(start: int, end: int, entity_spans: List[Tuple[int, int]]) -> bool:
+    """判断当前片段是否与任一实体区间重叠。"""
+    return any(start < entity_end and end > entity_start for entity_start, entity_end in entity_spans)
+
+
+def render_annotated_text_html(text: str, labeled_original: str) -> str:
+    """渲染可叠加的底色与下划线标注 HTML。"""
+    if not text:
+        return "<div class=\"token-visualization\"></div>"
+
+    segments = align_labels_to_text(text, labeled_original)
+    entity_spans = get_entity_spans(text)
+
+    html_segments: List[str] = []
+    for segment_text, label_name, start, end in segments:
+        escaped_text = html.escape(segment_text)
+        is_entity = (not segment_text.isspace()) and is_entity_segment(start, end, entity_spans)
+
+        if label_name is None and not is_entity:
+            html_segments.append(escaped_text)
+            continue
+
+        classes = ["token-span"]
+        if label_name is not None:
+            classes.append(f"token-{label_name}")
+        content = escaped_text
+        if is_entity:
+            content = f'<span class="token-entity">{escaped_text}</span>'
+
+        html_segments.append(f'<span class="{" ".join(classes)}">{content}</span>')
+
+    return f'<div class="token-visualization">{"".join(html_segments)}</div>'
 
 
 def create_performance_plot(result: CompressionResult):
@@ -101,7 +219,7 @@ def run_compression(
     custom_prompt: str,
     custom_query: str,
 ) -> Tuple[
-        List[Tuple[str, str]],  # token_heatmap_data
+    str,                    # token_heatmap_html
         str,                   # baseline_context
         str,                   # baseline_query
         str,                   # baseline_answer
@@ -136,7 +254,7 @@ def run_compression(
     else:
         example = get_example(selected_example)
         if example is None:
-            return [], "", "", "", "", "", "", go.Figure(), 0.0, 0.0, 0.0
+            return "", "", "", "", "", "", "", go.Figure(), 0.0, 0.0, 0.0
         context = example["context"]  # List[str]
         query = example.get("query", "What is the main point?")
 
@@ -151,9 +269,8 @@ def run_compression(
     )
 
     # 格式化输出
-    token_heatmap_data = parse_labeled_original_to_highlighted(result.labeled_original)
-
     baseline_context_str = "\n".join(context)
+    token_heatmap_html = render_annotated_text_html(baseline_context_str, result.labeled_original)
     compressed_context_str = result.compressed_prompt
 
     plot_data = create_performance_plot(result)
@@ -164,7 +281,7 @@ def run_compression(
     total_time_saved_val = ((result.total_time_original - result.total_time_compressed) / result.total_time_original * 100) if result.total_time_original > 0 else 0
 
     return (
-        token_heatmap_data,
+        token_heatmap_html,
         baseline_context_str,
         query,
         result.baseline_answer,
@@ -215,7 +332,7 @@ with gr.Blocks(title="Prompt Compressor Demo") as demo:
 
             # Query-Aware开关
             query_aware = gr.Checkbox(
-                label="**Query-Aware 模式**",
+                label="Query-Aware 模式",
                 value=True,
                 info="根据Query动态调整压缩策略",
                 interactive=True,
@@ -255,19 +372,12 @@ with gr.Blocks(title="Prompt Compressor Demo") as demo:
                 with gr.Column():
                     gr.Markdown("### Token 权重可视化")
                     gr.Markdown(
-                        "* 🟡 黄色=命名实体 | 🟢 绿色=关键保留 | ⬜ 浅灰=冗余删除*"
+                        "* 下划线=命名实体 | 🟢 绿色底色=关键保留 | ⬜ 浅灰底色=冗余删除*"
                     )
 
-                    token_heatmap = gr.HighlightedText(
-                        label="Token级别压缩决策",
-                        color_map={
-                            "entity": "#FFD700",  # 黄色 - 命名实体
-                            "keep": "#4CAF50",    # 绿色 - 关键保留
-                            "drop": "#F5F5F5",    # 浅灰 - 冗余删除
-                        },
-                        show_legend=True,
-                        combine_adjacent=True,
-                        interactive=False,
+                    token_heatmap = gr.HTML(
+                        value="",
+                        elem_id="token-heatmap-html",
                     )
 
             # 面板二：QA质量双栏对比
@@ -278,12 +388,18 @@ with gr.Blocks(title="Prompt Compressor Demo") as demo:
                         label="Original Context",
                         lines=4,
                         interactive=False,
+                        elem_classes="times-display",
                     )
-                    baseline_query = gr.Textbox(label="Query", interactive=False)
+                    baseline_query = gr.Textbox(
+                        label="Query",
+                        interactive=False,
+                        elem_classes="times-display",
+                    )
                     baseline_answer = gr.Textbox(
                         label="Generated Answer",
                         lines=6,
                         interactive=False,
+                        elem_classes="times-display",
                     )
 
                 with gr.Column(scale=1):
@@ -292,12 +408,18 @@ with gr.Blocks(title="Prompt Compressor Demo") as demo:
                         label="Compressed Context",
                         lines=4,
                         interactive=False,
+                        elem_classes="times-display",
                     )
-                    compressed_query = gr.Textbox(label="Query", interactive=False)
+                    compressed_query = gr.Textbox(
+                        label="Query",
+                        interactive=False,
+                        elem_classes="times-display",
+                    )
                     compressed_answer = gr.Textbox(
                         label="Generated Answer",
                         lines=6,
                         interactive=False,
+                        elem_classes="times-display",
                     )
 
             # 底部面板：性能指标对比
@@ -473,5 +595,6 @@ if __name__ == "__main__":
         server_name=server_name,
         server_port=server_port,
         share=False,
+        css=CUSTOM_CSS,
         theme=gr.themes.Soft(),
     )
